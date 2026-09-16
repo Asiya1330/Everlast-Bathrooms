@@ -1,0 +1,6 @@
+{
+  "name": "Everlast Bathrooms — Service Portal",
+  "description": "Field service call portal for Everlast Bathrooms. Multi-role assignment, phone-first installer interface, photo and video attachments, and completion tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
