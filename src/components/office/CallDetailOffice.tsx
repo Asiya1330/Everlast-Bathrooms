@@ -39,7 +39,7 @@ interface CallDetailOfficeProps {
   onBack: () => void;
   onUpdateCall: (callId: string, updates: Partial<ServiceCall>) => void;
   onAddNote: (callId: string, body: string, visibility: 'shared' | 'internal') => void;
-  onAddAttachment: (callId: string, attachment: Attachment) => void;
+  onUploadAttachment: (callId: string, file: File) => void;
 }
 
 export const CallDetailOffice: React.FC<CallDetailOfficeProps> = ({
@@ -49,7 +49,7 @@ export const CallDetailOffice: React.FC<CallDetailOfficeProps> = ({
   onBack,
   onUpdateCall,
   onAddNote,
-  onAddAttachment,
+  onUploadAttachment,
 }) => {
   const [activeLightboxMedia, setActiveLightboxMedia] = useState<Attachment | null>(null);
 
@@ -95,22 +95,7 @@ export const CallDetailOffice: React.FC<CallDetailOfficeProps> = ({
     if (!files || files.length === 0) return;
 
     Array.from(files).forEach((file: File) => {
-      const isVideo = file.type.startsWith('video/');
-      const newAtt: Attachment = {
-        id: 'att_office_' + Math.random().toString(36).substring(2, 9),
-        serviceCallId: call.id,
-        storagePath: `${call.id}/reported/${file.name}`,
-        fileName: file.name,
-        mimeType: file.type,
-        sizeBytes: file.size,
-        kind: isVideo ? 'video' : 'image',
-        phase: 'reported',
-        uploadedBy: currentUser.id,
-        uploaderName: currentUser.fullName,
-        createdAt: new Date().toISOString(),
-        url: URL.createObjectURL(file),
-      };
-      onAddAttachment(call.id, newAtt);
+      onUploadAttachment(call.id, file);
     });
   };
 
