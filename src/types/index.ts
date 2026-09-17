@@ -12,7 +12,7 @@ export interface UserProfile {
   fullName: string;
   role: UserRole;
   email: string;
-  phone?: string;
+  phone?: string | null;
   isActive: boolean;
   notifyByEmail: boolean;
   createdAt: string;
@@ -21,9 +21,9 @@ export interface UserProfile {
 export interface Client {
   id: string;
   name: string;
-  phone?: string;
-  email?: string;
-  address?: string;
+  phone?: string | null;
+  email?: string | null;
+  address?: string | null;
   createdAt: string;
 }
 
@@ -39,7 +39,7 @@ export interface Attachment {
   uploadedBy: string;
   uploaderName?: string;
   createdAt: string;
-  url: string; // Blob or signed URL
+  url: string; // Signed Supabase Storage URL
 }
 
 export interface ServiceCallNote {
@@ -82,32 +82,9 @@ export interface ServiceCall {
 export interface NotificationLog {
   id: string;
   serviceCallId: string;
-  jobNumber: string;
-  clientName: string;
   recipientEmail: string;
-  recipientName: string;
   eventType: 'new_call' | 'updated' | 'reassigned' | 'overdue' | 'completed';
-  subject: string;
-  bodyHtml: string;
   status: 'sent' | 'queued' | 'failed';
-  error?: string;
-  sentAt: string;
+  error?: string | null;
   createdAt: string;
-}
-
-export interface InstallerMonthlyStat {
-  id: string;
-  installerId: string;
-  installerName: string;
-  periodMonth: string; // YYYY-MM-01
-  projectsCompleted: number;
-  updatedAt: string;
-}
-
-export interface InstallerRate90d {
-  installerId: string;
-  fullName: string;
-  totalProjects: number;
-  totalServiceCalls: number;
-  serviceCallPct: number | null;
 }

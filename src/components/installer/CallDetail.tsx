@@ -29,8 +29,9 @@ interface CallDetailProps {
   call: ServiceCall;
   currentUser: UserProfile;
   onBack: () => void;
-  onStatusUpdate: (status: 'completed' | 'blocked' | 'in_progress', note?: string, resolutionAttachments?: Attachment[]) => void;
-  onAddNote: (noteText: string) => void;
+  onStatusUpdate: (status: 'completed' | 'blocked' | 'in_progress', note?: string) => void | Promise<void>;
+  onAddNote: (noteText: string) => void | Promise<void>;
+  onRefresh: () => void | Promise<void>;
 }
 
 export const CallDetail: React.FC<CallDetailProps> = ({
@@ -39,6 +40,7 @@ export const CallDetail: React.FC<CallDetailProps> = ({
   onBack,
   onStatusUpdate,
   onAddNote,
+  onRefresh,
 }) => {
   const [activeLightboxMedia, setActiveLightboxMedia] = useState<Attachment | null>(null);
   const [showCompleteModal, setShowCompleteModal] = useState(false);
@@ -345,9 +347,10 @@ export const CallDetail: React.FC<CallDetailProps> = ({
         currentUser={currentUser}
         isOpen={showCompleteModal}
         onClose={() => setShowCompleteModal(false)}
-        onConfirm={(note, photos) => {
+        onConfirm={async (note) => {
           setShowCompleteModal(false);
-          onStatusUpdate('completed', note, photos);
+          await onRefresh();
+          await onStatusUpdate('completed', note);
         }}
       />
 

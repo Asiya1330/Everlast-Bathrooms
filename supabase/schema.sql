@@ -1,8 +1,10 @@
 -- Everlast Bathrooms — Service Call Portal
--- Milestone 1 & 2 Database Schema & Row-Level Security (RLS)
+-- Milestone 1 Database Schema & Row-Level Security (RLS)
 -- Run this in your Supabase Dashboard > SQL Editor
 
--- 1. Create Enums (Idempotent)
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- 1. Enums (idempotent)
 DO $$ BEGIN
   CREATE TYPE user_role AS ENUM ('admin', 'office', 'installer');
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
@@ -51,6 +53,46 @@ CREATE TABLE IF NOT EXISTS profiles (
 CREATE INDEX IF NOT EXISTS idx_profiles_role_active ON profiles (role) WHERE is_active = true;
 CREATE INDEX IF NOT EXISTS idx_profiles_email ON profiles (email);
 
+-- Auto-create a profile row when a new auth user signs up.
+-- Role/full_name default here; an admin should update them via the dashboard
+-- or a follow-up UPDATE after inviting a crew member.
+CREATE OR REPLACE FUNCTION public.handle_new_user() RETURNS TRIGGER
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  safe_full_name TEXT;
+  safe_role public.user_role;
+BEGIN
+  -- Guard against a blank/too-short name failing the profiles CHECK constraint.
+  safe_full_name := COALESCE(NEW.raw_user_meta_data->>'full_name', NEW.email);
+  IF safe_full_name IS NULL OR length(safe_full_name) < 2 THEN
+    safe_full_name := NEW.email;
+  END IF;
+
+  -- Guard against an invalid/unexpected role value failing the enum cast.
+  BEGIN
+    safe_role := COALESCE((NEW.raw_user_meta_data->>'role')::public.user_role, 'installer');
+  EXCEPTION WHEN OTHERS THEN
+    safe_role := 'installer';
+  END;
+
+  INSERT INTO public.profiles (id, full_name, role, email)
+  VALUES (NEW.id, safe_full_name, safe_role, NEW.email)
+  ON CONFLICT (id) DO NOTHING;
+
+  RETURN NEW;
+EXCEPTION WHEN unique_violation THEN
+  -- A profile with this email already exists (e.g. a re-invite / retry);
+  -- don't block auth.users creation over it.
+  RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION handle_new_user();
+
 -- 3. Clients
 CREATE TABLE IF NOT EXISTS clients (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -62,7 +104,9 @@ CREATE TABLE IF NOT EXISTS clients (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- 4. Service Calls (The core table)
+CREATE INDEX IF NOT EXISTS idx_clients_name ON clients USING gin (name gin_trgm_ops);
+
+-- 4. Service Calls (the core table)
 CREATE TABLE IF NOT EXISTS service_calls (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   job_number TEXT NOT NULL CHECK (length(job_number) BETWEEN 1 AND 30),
@@ -129,18 +173,7 @@ CREATE TABLE IF NOT EXISTS service_call_notes (
 
 CREATE INDEX IF NOT EXISTS idx_notes_call_time ON service_call_notes (service_call_id, created_at DESC);
 
--- 7. Installer Monthly Stats (Denominator for 90-day rate)
-CREATE TABLE IF NOT EXISTS installer_monthly_stats (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  installer_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-  period_month DATE NOT NULL,
-  projects_completed INTEGER NOT NULL CHECK (projects_completed >= 0),
-  updated_by UUID REFERENCES profiles(id) ON DELETE SET NULL,
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CONSTRAINT unq_installer_month UNIQUE (installer_id, period_month)
-);
-
--- 8. Notification Log (Fixed constraint using standard DATE column)
+-- 7. Notification Log
 CREATE TABLE IF NOT EXISTS notification_log (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   service_call_id UUID REFERENCES service_calls(id) ON DELETE CASCADE,
@@ -155,14 +188,40 @@ CREATE TABLE IF NOT EXISTS notification_log (
   CONSTRAINT unq_notification_day UNIQUE (service_call_id, recipient_email, event_type, created_date)
 );
 
--- 9. Row-Level Security (RLS) - CRITICAL: Database-Level Isolation
-CREATE OR REPLACE FUNCTION auth_role() RETURNS user_role
-LANGUAGE sql STABLE SECURITY DEFINER AS $$
-  SELECT role FROM profiles WHERE id = auth.uid()
+-- 8. Row-Level Security (RLS) — database-level installer isolation
+CREATE OR REPLACE FUNCTION public.auth_role() RETURNS public.user_role
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT role FROM public.profiles WHERE id = auth.uid()
 $$;
 
+ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE clients ENABLE ROW LEVEL SECURITY;
 ALTER TABLE service_calls ENABLE ROW LEVEL SECURITY;
+ALTER TABLE attachments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE service_call_notes ENABLE ROW LEVEL SECURITY;
 
+-- profiles: everyone signed in can read profiles (needed for assignment dropdowns
+-- and displaying installer names); only admin/office can write.
+DROP POLICY IF EXISTS "read all profiles" ON profiles;
+CREATE POLICY "read all profiles" ON profiles FOR SELECT
+USING (auth.uid() IS NOT NULL);
+
+DROP POLICY IF EXISTS "admin office manage profiles" ON profiles;
+CREATE POLICY "admin office manage profiles" ON profiles FOR UPDATE
+USING (auth_role() IN ('admin', 'office'));
+
+-- clients: readable by anyone signed in; writable by admin/office.
+DROP POLICY IF EXISTS "read all clients" ON clients;
+CREATE POLICY "read all clients" ON clients FOR SELECT
+USING (auth.uid() IS NOT NULL);
+
+DROP POLICY IF EXISTS "office and admin insert clients" ON clients;
+CREATE POLICY "office and admin insert clients" ON clients FOR INSERT
+WITH CHECK (auth_role() IN ('admin', 'office'));
+
+-- service_calls: installers see only their own rows; admin/office see all.
 DROP POLICY IF EXISTS "installers read own calls" ON service_calls;
 CREATE POLICY "installers read own calls"
 ON service_calls FOR SELECT
@@ -181,13 +240,65 @@ CREATE POLICY "office and admin update anything"
 ON service_calls FOR UPDATE
 USING (auth_role() IN ('admin', 'office'));
 
--- 10. RPC: installer_complete_call (Constrained Installer Action)
-CREATE OR REPLACE FUNCTION installer_complete_call(
+-- attachments: visible to anyone who can see the parent call; anyone signed in can upload.
+DROP POLICY IF EXISTS "read attachments of visible calls" ON attachments;
+CREATE POLICY "read attachments of visible calls" ON attachments FOR SELECT
+USING (
+  EXISTS (
+    SELECT 1 FROM service_calls sc
+    WHERE sc.id = attachments.service_call_id
+      AND (auth_role() IN ('admin', 'office') OR sc.installer_id = auth.uid())
+  )
+);
+
+DROP POLICY IF EXISTS "insert attachments on visible calls" ON attachments;
+CREATE POLICY "insert attachments on visible calls" ON attachments FOR INSERT
+WITH CHECK (
+  EXISTS (
+    SELECT 1 FROM service_calls sc
+    WHERE sc.id = attachments.service_call_id
+      AND (auth_role() IN ('admin', 'office') OR sc.installer_id = auth.uid())
+  )
+);
+
+-- service_call_notes: same visibility rule as attachments; installers only post 'shared' notes.
+DROP POLICY IF EXISTS "read notes of visible calls" ON service_call_notes;
+CREATE POLICY "read notes of visible calls" ON service_call_notes FOR SELECT
+USING (
+  EXISTS (
+    SELECT 1 FROM service_calls sc
+    WHERE sc.id = service_call_notes.service_call_id
+      AND (auth_role() IN ('admin', 'office') OR sc.installer_id = auth.uid())
+  )
+);
+
+DROP POLICY IF EXISTS "insert notes on visible calls" ON service_call_notes;
+CREATE POLICY "insert notes on visible calls" ON service_call_notes FOR INSERT
+WITH CHECK (
+  author_id = auth.uid()
+  AND (
+    auth_role() IN ('admin', 'office')
+    OR (
+      visibility = 'shared'
+      AND EXISTS (
+        SELECT 1 FROM service_calls sc
+        WHERE sc.id = service_call_notes.service_call_id AND sc.installer_id = auth.uid()
+      )
+    )
+  )
+);
+
+-- 9. RPC: installer_complete_call (Section 5.11) — the only write path
+-- installers have on service_calls: status in ('completed','blocked','in_progress'),
+-- and a blocked call must carry a reason note.
+CREATE OR REPLACE FUNCTION public.installer_complete_call(
   p_call_id UUID,
-  p_status call_status,
+  p_status public.call_status,
   p_note TEXT
 ) RETURNS VOID
-LANGUAGE plpgsql SECURITY DEFINER AS $$
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
 BEGIN
   IF p_status NOT IN ('completed', 'blocked', 'in_progress') THEN
     RAISE EXCEPTION 'Installers cannot set status %', p_status;
@@ -197,11 +308,11 @@ BEGIN
     RAISE EXCEPTION 'A reason note is required when marking a call blocked';
   END IF;
 
-  UPDATE service_calls
+  UPDATE public.service_calls
      SET status          = p_status,
-         completion_note = p_note,
-         completed_at    = CASE WHEN p_status = 'completed' THEN now() END,
-         completed_by    = CASE WHEN p_status = 'completed' THEN auth.uid() END,
+         completion_note = COALESCE(p_note, completion_note),
+         completed_at    = CASE WHEN p_status = 'completed' THEN now() ELSE completed_at END,
+         completed_by    = CASE WHEN p_status = 'completed' THEN auth.uid() ELSE completed_by END,
          updated_at      = now()
    WHERE id = p_call_id
      AND installer_id = auth.uid();
@@ -211,26 +322,29 @@ BEGIN
   END IF;
 END $$;
 
--- 11. The 90-day Service Call Rate View
-CREATE OR REPLACE VIEW installer_service_rate_90d AS
-SELECT
-  p.id AS installer_id,
-  p.full_name,
-  coalesce(sum(s.projects_completed), 0) AS total_projects,
-  count(distinct c.id) AS total_service_calls,
-  CASE
-    WHEN coalesce(sum(s.projects_completed), 0) = 0 THEN NULL
-    ELSE round(
-      count(distinct c.id)::numeric
-      / sum(s.projects_completed)::numeric * 100, 0)
-  END AS service_call_pct
-FROM profiles p
-LEFT JOIN installer_monthly_stats s
-  ON s.installer_id = p.id
- AND s.period_month >= date_trunc('month', CURRENT_DATE - INTERVAL '90 days')
-LEFT JOIN service_calls c
-  ON c.installer_id = p.id
- AND c.reported_date >= CURRENT_DATE - INTERVAL '90 days'
- AND c.responsibility = 'installer'
-WHERE p.role = 'installer' AND p.is_active = true
-GROUP BY p.id, p.full_name;
+-- 10. Storage bucket for photos/videos (private; access via signed URLs only)
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('service-call-media', 'service-call-media', false)
+ON CONFLICT (id) DO NOTHING;
+
+DROP POLICY IF EXISTS "read media of visible calls" ON storage.objects;
+CREATE POLICY "read media of visible calls" ON storage.objects FOR SELECT
+USING (
+  bucket_id = 'service-call-media'
+  AND EXISTS (
+    SELECT 1 FROM service_calls sc
+    WHERE sc.id::text = (storage.foldername(name))[1]
+      AND (auth_role() IN ('admin', 'office') OR sc.installer_id = auth.uid())
+  )
+);
+
+DROP POLICY IF EXISTS "upload media on visible calls" ON storage.objects;
+CREATE POLICY "upload media on visible calls" ON storage.objects FOR INSERT
+WITH CHECK (
+  bucket_id = 'service-call-media'
+  AND EXISTS (
+    SELECT 1 FROM service_calls sc
+    WHERE sc.id::text = (storage.foldername(name))[1]
+      AND (auth_role() IN ('admin', 'office') OR sc.installer_id = auth.uid())
+  )
+);
